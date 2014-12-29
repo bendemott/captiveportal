@@ -1,0 +1,667 @@
+#!/usr/bin/env python
+"""
+I'm trying to implement a captive portal.  There are a couple ways to go about it.
+
+For this try, we'll just keep track of things ourselves using client IP address.
+We'll ask iptables to forward all http traffic to us, then we'll proxy the request
+to the internet.  Clients that have agreed to our terms will be sent to their requested sites.
+
+The server startup should trigger the IP-RULES being put in place. we can install the server
+as a service if we like.
+
+On shutdown, the server should clean up after itself, and restore firewall rules.
+
+See this project for more ideas: https://github.com/voldyman/CaptivePortal
+"""
+# TODO finish building a SSH KEY on-the-fly to allow HTTPS redirects.
+# TODO listen on https
+import os, signal, sys
+import socket
+import argparse
+import cgi
+import fcntl
+import struct
+import urllib
+from urlparse import urlparse
+from string import Template
+import subprocess
+
+from twisted.application import internet, service
+from twisted.web.http_headers import Headers
+from twisted.internet import reactor
+from twisted.internet.address import IPv4Address
+from twisted.web import server, resource
+from twisted.web.util import Redirect
+from twisted.web.server import Site, NOT_DONE_YET
+from twisted.web.proxy import ProxyClientFactory
+from twisted.web.resource import NoResource
+from twisted.scripts._twistd_unix import ServerOptions, UnixApplicationRunner
+from twisted.python import log
+
+APPNAME = 'captiveportal'
+# the port to listen on (this should be the same port you are using for HTTP communications)
+# we also redirect HTTPS port 443.
+HTTP_PORT = 80
+PIDFILE = '/var/run/captiveportal.pid'
+INTERFACE = 'wlan0'
+DEFAULT_REDIRECT = 'http://cnn.com'
+
+CAPTIVE_TEMPLATE = """
+<!doctype html>
+<!--
+    This is a template used by the our twisted captive portal.
+    This template expects certain keyword-vars to be passed in to work using pythons
+    very simple string.Template()
+-->
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="A Captive Portal written in Twisted">
+    <title>Captive Portal Test</title>
+    <link rel="stylesheet" href="http://yui.yahooapis.com/pure/0.5.0/pure-min.css">
+    <link rel="stylesheet" href="http://yui.yahooapis.com/pure/0.5.0/base-min.css">
+    <link rel="stylesheet" href="http://fonts.googleapis.com/css?family=Raleway:200">
+    <style>
+        body {
+            min-width: 320px;
+            font-family: sans-serif;
+            line-height: 1.6;
+            color: #777;
+        }
+        a {
+            color: #3b8bba;
+            text-decoration: none;
+        }
+        a:visited {
+            color: #265778;
+        }
+        .header {
+            max-width: 768px;
+            margin: 0 auto;
+            padding-left: 2em;
+            padding-right: 2em;
+            padding: 1em;
+            font-family: "Raleway", "Helvetica Neue", Helvetica, Arial, sans-serif;
+            text-align: center;
+            border-bottom: 1px solid #eee;
+            background: #fff;
+            letter-spacing: 0.05em;
+        }
+        .header h2 {
+            font-size: 128%;
+            line-height: 1.5;
+            margin: 0;
+            color: #666;
+            letter-spacing: -0.02em;
+        }
+        .content {
+            padding-left: 2em;
+            padding-right: 2em;
+            margin-left: auto;
+            margin-right: auto;
+            max-width: 768px;
+        }
+        .content p {
+            font-size: 1.125em;
+        }
+        p, pre {
+            margin: 1em 0;
+        }
+        aside {
+            background: #1f8dd6;
+            padding: 0.3em 1em;
+            margin: 1em 0;
+            border-radius: 3px;
+            color: #fff;
+        }
+        .button-xlarge {
+            font-size: 130%;
+        }
+        .button-success {
+            background: rgb(28, 184, 65); /* green */
+            font-weight: 100;
+            letter-spacing: 0.01em;
+            text-transform: none;
+            margin: 0;
+            padding: 10 20 10 20
+        }
+        div .pure-u-1-3 {
+            text-align: center;
+        }
+        .code {
+            margin-left: auto;
+            margin-right: auto;
+            border-left-width: 1px;
+            border-right-width: 1px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Captive Portal</1>
+        <h2>Simple captive-portal discovery test</h2>
+    </div>
+    <div class="content">
+        <aside style="text-align: center;">
+            <p>Click the button below to leave the <b>captive portal</b>. <br> <i>Issue the command:</i>
+            <span style="font-family: monospace; white-space: nowrap; font-size:110%">`captiveportal reset`</span>
+            <i> to reset authenticated users.</i></p>
+        </aside>
+        <p>
+            You have been captured by a simulated captive portal. The portal works by intercepting the
+            HTTP traffic sent to your Access Point (<i>$ap_name</i>)<br>
+            The intercepted request, responds with a <b>302</b> temporarily moved status which
+            redirects your browser here.  After we add your computers local address to our
+            allowed list all further requests will be allowed to pass to
+            <a href="$referrer_url">$referrer_domain</a>.
+        </P>
+        <div class="pure-g">
+            <div class="pure-u-1-3"></div>
+            <div class="pure-u-1-3">
+                <form action="/authenticate" method="get">
+                    <input type="hidden" name="s" value="$referrer_url">
+                    <input type="submit"
+                        class="pure-button pure-button-primary button-success button-xlarge"
+                        value="Allow $client_ip"
+                    </input>
+                </form>
+            </div>
+            <div class="pure-u-1-3"></div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+EXTERNAL_LINKS = set() # allowable external links (like resources and javascript)
+ALLOWED_CLIENT_IPS = set() # Stores client's that have passed the captive portal # SIGHUP reset this
+
+
+def sighup_handler(signal, frame):
+    """
+    Reset authenticated portal users when SIGHUP is received.
+    Use: ``kill -HUP <pid>``
+    """
+    global ALLOWED_CLIENT_IPS
+    ALLOWED_CLIENT_IPS = set()
+    log.msg('RESET AUTHENTICATED USERS')
+    
+#signal.signal(signal.SIGHUP, sighup_handler) # setup the signal handler.
+
+
+def process_pid():
+    """
+    Return the pid (if running) of this service
+    """
+    if not os.path.exists(PIDFILE):
+        return None
+        
+    # check for read access first
+    try:
+        open(PIDFILE, 'r')
+    except IOError as e:
+        if 'permission' in str(e).lower():
+            sys.stderr.write(str(e) + ' (use sudo)\n')
+        else:
+            sys.stderr.write(str(e) + '\n')
+        return -1
+       
+    # read the pid file 
+    with open(PIDFILE, 'r') as f:
+        try:
+            pidstr = f.read()
+            pid = int(pidstr)
+        except ValueError:
+            # not an integer
+            sys.stderr.write("pid unreadable: %s\n" % pidstr)
+            return -1
+
+        # make sure the process is running (linux only)
+        try:
+            os.kill(pid, 0)
+        except OSError as e:
+            #sys.stdout.write("%s isn't running\n" % APPNAME)
+            return None
+        else:
+            #sys.stdout.write("%s running [%s]\n" % (APPNAME, pid))  
+            return pid
+
+def get_iface_address(ifname):
+    """
+    get the ip address of the interface <ifname> such as "wlan0"
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    return socket.inet_ntoa(fcntl.ioctl(
+        s.fileno(),
+        0x8915,  # SIOCGIFADDR
+        struct.pack('256s', ifname[:15])
+    )[20:24])
+
+def get_template_links():
+    """
+    Dynamically parse links from our captive portal page for allowable out-bound pages.
+    This way any updates to perform to the template will automatically be allowed.
+    """
+    urls = set()
+    
+    from HTMLParser import HTMLParser
+
+    # create a subclass and override the handler methods
+    class HrefParser(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            """
+            for each tag encounterd, returns the name of the tag like "a"
+            and the attributes as a list of tuples... ``[('href', 'http://www.cwi.nl/')]``
+            """
+            if tag not in ('a', 'link'):
+                return
+            for attr, val in attrs:
+                if attr != 'href':
+                    continue
+                urls.add(val) # append to the list of allowable links.
+  
+    parser = HrefParser()
+    parser.feed(CAPTIVE_TEMPLATE)
+    return urls
+    
+def get_hostap_ssid():
+    """
+    calculate the SSID from the hostap.conf file.
+    """
+    # first we have to look for a line like this:
+    #    DAEMON_CONF="/etc/hostapd/hostapd.conf"
+    # in /etc/default/hostapd
+    # Then based on the location of the HOSTAPD user config
+    # we look for a line like:
+    #   ssid=accesspoint
+    HOSTAPD_DEFAULT = "/etc/default/hostapd"
+    HOSTAPD_CONFIG = ''
+    if not os.path.isfile(HOSTAPD_DEFAULT):
+        return '?'
+        
+    for line in open(HOSTAPD_DEFAULT, mode='r'):
+        if line.strip().startswith('#'):
+            continue
+        elif line.strip().startswith('DAEMON_CONF'):
+            HOSTAPD_CONFIG = line.split('=')[1].strip().replace('"', '')
+    
+    #log.msg('HOSTAPD CONFIG PATH: %s' % HOSTAPD_CONFIG)
+    if not os.path.isfile(HOSTAPD_CONFIG):
+        return '?'
+        
+    for line in open(HOSTAPD_CONFIG, mode='r'):
+        if line.strip().startswith('#'):
+            continue
+        elif line.strip().startswith('ssid'):
+            return line.split('=')[1].strip().replace('"', '')
+             
+    return '?'
+    
+
+class PortalPage(resource.Resource):
+    """
+    resource that renders the form page.
+    """
+        
+    def render(self, request):
+        # collect variables to render request.
+        source = request.args.get('s', [None])[0]
+        # if source is point to "us" point it to the default outbound domain.
+        if source and not source.startswith(request.site.SELF_ADDRESS):
+            domain = urlparse(source).netloc
+        else:
+            source = DEFAULT_REDIRECT
+            domain = urlparse(source).netloc
+        tplvars = {
+            'ap_name': request.site.WLAN_SSID,
+            'client_ip': str(request.getClientIP()),
+            'referrer_domain': domain,
+            'referrer_url': cgi.escape(source, True), # used in HTML attribute
+        }
+        return Template(CAPTIVE_TEMPLATE).substitute(**tplvars)
+
+
+class AuthPage(resource.Resource):
+    """
+    resource that authenticates the user.
+    performs redirect back to the original url they requested.
+    
+    The original url is held in the "s" GET argument.
+    """
+        
+    def render(self, request):
+        # authenticate the client.
+        global ALLOWED_CLIENT_IPS
+        ALLOWED_CLIENT_IPS.add(str(request.getClientIP()))
+        source = request.args.get('s', [None])[0]
+        if not source:
+            source = DEFAULT_REDIRECT
+
+        # if we have the original source redirect the user there.
+        log.msg('auth redirecting to %s' % source)
+        if not source.startswith('http'):
+            source = 'http://%s' % source
+        return Redirect(source).render(request)
+             
+
+
+class CaptivePortalRouter(resource.Resource):
+    """
+    This class is a simple resource and it will route http requests.
+    
+    **Request Object**
+    
+    see: http://twistedmatrix.com/documents/current/api/twisted.web.http.Request.html
+    
+    ::
+    
+			{'_adapterCache': {},
+			 'args': {'asdf': ['1']},
+			 'channel': <twisted.web.http.HTTPChannel instance at 0x7f331551b3b0>,
+			 'client': IPv4Address(TCP, '76.253.96.234', 35938),
+			 'clientproto': 'HTTP/1.1',
+			 'content': <cStringIO.StringO object at 0x7f33155108b8>,
+			 'cookies': [],
+			 'headers': {'date': 'Thu, 10 Mar 2011 06:48:14 GMT', 'content-type': 'text/html', 'server': 'TwistedWeb/10.2.0'},
+			 'host': IPv4Address(TCP, '192.168.1.156', 80),
+			 'method': 'GET',
+			 'notifications': [],
+			 'path': '/asdf/blah',
+			 'postpath': ['asdf', 'blah'],
+			 'prepath': [],
+			 'queued': 0,
+			 'received_cookies': {},
+			 'received_headers': {'accept-language': 'en-us,en;q=0.5', 'accept-encoding': 'gzip,deflate', 'keep-alive': '115', 'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'user-agent': 'Mozilla/5.0 (X11; U; Linux x86_64; en-US; rv:1.9.2.13) Gecko/20101206 Ubuntu/10.04 (lucid) Firefox/3.6.13', 'accept-charset': 'ISO-8859-1,utf-8;q=0.7,*;q=0.7', 'connection': 'keep-alive', 'cache-control': 'max-age=0', 'host': 'workspace.common.pms'},
+			 'requestHeaders': Headers({'accept-language': ['en-us,en;q=0.5'], 'accept-encoding': ['gzip,deflate'], 'connection': ['keep-alive'], 'keep-alive': ['115'], 'accept': ['text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'], 'user-agent': ['Mozilla/5.0 (X11; U; Linux x86_64; en-US; rv:1.9.2.13) Gecko/20101206 Ubuntu/10.04 (lucid) Firefox/3.6.13'], 'accept-charset': ['ISO-8859-1,utf-8;q=0.7,*;q=0.7'], 'host': ['workspace.common.pms'], 'cache-control': ['max-age=0']}),
+			 'responseHeaders': Headers({'date': ['Thu, 10 Mar 2011 06:48:14 GMT'], 'content-type': ['text/html'], 'server': ['TwistedWeb/10.2.0']}),
+			 'site': <twisted.web.server.Site instance at 0x7f331550dc68>,
+			 'sitepath': [],
+			 'stack': [],
+			 'transport': <HTTPChannel #0 on 80>,
+			 'uri': '/asdf/blah?asdf=1'}
+    """
+	
+    def getChild(self, path, request):
+        """
+        called to determine which resource is returned and rendered.
+        """
+        # preserve the protocol the user came in on. # TODO this probably won't work.
+        # because HTTPS proxies don't work yet?  You might have to build your own
+        # client to request the resources for this to work.
+        http = 'https://' if request.isSecure() else 'http://'
+        url2 = request.URLPath().__str__() # the fully qualified url, including URI and arguments.
+        url = http + request.getRequestHostname() + request.uri # consider request.clientproto if you want to check for https
+
+        if url in request.site.ALLOWED_URLS:
+            log.msg('allowed-url proxying to %s' % url)
+            return self
+        elif (not url.startswith(request.site.SELF_ADDRESS)
+            and str(request.getClientIP()) in ALLOWED_CLIENT_IPS):
+            # The condition is to ensure we don't proxy to ourselves, that would create
+            # an infinite proxy loop which would be bad.
+            log.msg('proxying to %s' % url)
+            return self
+        else:
+            if request.path == '/authenticate':
+                return AuthPage()  #go to authenticate
+            elif request.path == '/capture':
+                return PortalPage() #go to captive-portal message
+            else:
+                log.msg('redirecting to portal')
+                # redirect the user to our captive portal message.
+                # without a redirect this isn't really a `captive portal`
+                # so it's important we do perform a 302 redirect.
+                # we set the "s" (source) parameter to the original FQDN/URL they were requesting.
+                return Redirect('%s/capture?s=%s' % (request.site.SELF_ADDRESS, urllib.quote(url)))
+            
+    
+    def render(self, request):
+        """
+        This method proxy
+        """
+        if request.site.WLAN_IP in request.getRequestHostname():
+            return 'circular reference'
+        log.msg(request.site.WLAN_IP)
+        log.msg(request.getRequestHostname())
+        
+        fwd_headers = {key: val[0] for key, val in request.requestHeaders.getAllRawHeaders()}
+        
+        proxy_factory = ProxyClientFactory(
+            command=request.method,
+            rest=request.uri or '',
+            version=request.clientproto,
+            headers=fwd_headers,
+            data=request.content.read(),
+            father=request,
+        )
+        reactor.connectTCP(request.getRequestHostname(), 80, proxy_factory, timeout=60)
+        return NOT_DONE_YET
+	
+	
+class CustomApplicationRunner(UnixApplicationRunner):
+    """
+    Re-use Twisteds functionality to start the app and respect command-line options
+    """
+
+    def run(self, application):
+        """
+        Copied from twisted/application/app in ApplicationRunner
+        """
+        self.preApplication()
+        self.application = application # this line is custom, so it uses OUR application
+        self.logger.start(self.application)
+        self.postApplication()
+        self.logger.stop()
+        
+def clear_open_connections(ipaddress):
+    """
+    Clear all open HTTP to this server on it's gateway (listening) address.
+    This will cause the captive portal rules to take effect immediately by
+    forcing the client to NOT reuse existing connections.
+    """
+    cmd = "sudo netstat -tunp|grep %s:80" % ipaddress
+    subprocess.check_output(cmd, shell=True)
+
+def setup_iptables(ipaddress, port):
+    """
+    Setup iptables networking forwarding.
+    """
+    cmds = ["sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j DNAT --to-destination {ip}:{http}".format(http=port, ip=ipaddress),
+            #"sudo iptables -t nat -A PREROUTING -p tcp --dport 443 -j DNAT --to-destination  {ip}:443",
+            "sudo iptables -t nat -A POSTROUTING -j MASQUERADE"]
+    for cmd in cmds:
+        subprocess.check_output(cmd, shell=True)
+
+def reset_iptables(ipaddress, port):
+    """
+    Remove iptables rules before we exit.
+    
+    The rule:
+        sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j DNAT --to-destination 192.168.1.1:80
+    is removed:
+        sudo iptables -t nat -D PREROUTING -p tcp --dport 80 -j DNAT --to-destination 192.168.1.1:80
+    """
+    cmds = ["sudo iptables -t nat -D PREROUTING -p tcp --dport 80 -j DNAT --to-destination {ip}:{http}".format(http=port, ip=ipaddress),
+            #"sudo iptables -t nat -A PREROUTING -p tcp --dport 443 -j DNAT --to-destination  {ip}:443",
+            "sudo iptables -t nat -D POSTROUTING -j MASQUERADE"]
+    for cmd in cmds:
+        try:
+            subprocess.check_output(cmd, shell=True)
+        except Exception as e:
+            log.msg("error clearing routing rule: %s" % e)
+
+def start(args):
+    global HTTP_PORT
+    global INTERFACE
+    HTTP_PORT = args.get('port') or 80
+    INTERFACE = args.get('interface') or 'wlan0'
+
+    pid = process_pid()
+    if pid:
+        sys.stdout.write("%s running [%s]\n" % (APPNAME, pid))  
+        return -1
+        
+    if args.get('log'):
+        log.startLogging(sys.stdout) # start logging to stdout.
+    
+
+   # set the application variable to tabletservice
+    site = server.Site(CaptivePortalRouter())
+    # some site vars -- can be accessed from `request.site`
+    site.ALLOWED_URLS = get_template_links()
+    log.msg(str(site.ALLOWED_URLS))
+    site.WLAN_IP = get_iface_address(INTERFACE)
+    site.WLAN_SSID = get_hostap_ssid()
+    site.SELF_ADDRESS = 'http://%s' % site.WLAN_IP
+    
+    reactor.addSystemEventTrigger('before', 'startup', clear_open_connections, site.WLAN_IP)
+    reactor.addSystemEventTrigger('before', 'startup', setup_iptables, site.WLAN_IP, HTTP_PORT)
+    reactor.addSystemEventTrigger('after', 'startup', signal.signal, signal.SIGHUP, sighup_handler)
+    reactor.addSystemEventTrigger('before', 'shutdown', reset_iptables, site.WLAN_IP, HTTP_PORT)
+    
+    tcpserver = internet.TCPServer(int(HTTP_PORT), site)
+    appservice = service.MultiService()
+    appservice.addService(tcpserver)
+   
+    application = service.Application('')
+    appservice.setServiceParent(application)
+
+    twistd_config = ServerOptions()
+    twistd_config['originalname'] = None
+    twistd_config['nodaemon'] = args.get('nodaemon', False)
+    twistd_config['no_save'] = True # do not save the state of the program, we'll never use this functionality.
+    twistd_config['logfile'] = '/var/log/captiveportal'
+    twistd_config['pidfile'] = PIDFILE
+    twistd_config.postOptions()
+    
+    sys.stdout.write("%s [%s] started\n" % (APPNAME, os.getpid()))
+    sys.stdout.flush()
+    
+    # now setup our application runner, and run the application.
+    app = CustomApplicationRunner(twistd_config)
+    app.run(application)
+    
+def stop(args):
+    """
+    handle the ``spotontablet stop`` cli sub-command
+
+    :param args: a dictionary of command arguments
+    """
+    if not os.path.exists(PIDFILE):
+        sys.stdout.write("%s isn't running\n" % APPNAME)
+        return 0
+    
+    # check for read access first
+    try:
+        open(PIDFILE, 'r')
+    except IOError as e:
+        if 'permission' in str(e).lower():
+            sys.stderr.write(str(e) + ' (use sudo)\n')
+        else:
+            sys.stderr.write(str(e) + '\n')
+        return -1
+        
+    with open(PIDFILE, 'r') as f:
+        try:
+            pidstr = f.read()
+            pid = int(pidstr)
+        except ValueError:
+            # not an integer
+            sys.stderr.write("pid unreadable: %s\n" % pidstr)
+            return -1
+            
+        try:
+            # passing 0 for the SIG argument can be used to check the
+            # status of the process, if no exception is raised that means
+            # the process is running.
+            os.kill(pid, 0)
+        except OSError as e:
+            sys.stdout.write("%s isn't running\n" % APPNAME)
+            return 0
+        else:
+            # this means the app is running
+            os.kill(pid, signal.SIGTERM)
+            sys.stdout.write("%s [%s] stopped\n" % (APPNAME, pid))
+            try:
+                os.remove(PIDFILE)
+            except (IOError, OSError) as e:
+                sys.stdout.write('Unable to remove pidfile: ' + str(e) + '\n')
+            return 0
+
+   
+def status(args):
+    """
+    handle the ``spotontablet status`` cli sub-command
+
+    :param args: a dictionary of command arguments
+    """        
+    pid = process_pid()
+    if pid:
+        sys.stdout.write("%s running [%s]\n" % (APPNAME, pid))  
+        return 0
+    elif pid is None:
+        sys.stdout.write("not running")
+        
+def restart(args):
+    """
+    handle the ``spotontablet restart`` cli sub-command
+    
+    Note that the restart command does not accept any command-line arguments
+    (unlike the start command), so you must have all directives in the configuration.
+
+    :param args: a dictionary of command arguments
+    """
+    stop({})
+    start({})
+    
+def reset(args):
+    pid = process_pid()
+    if pid is None:
+        sys.exit("not running")
+    os.kill(pid, signal.SIGHUP)
+    sys.exit("reset user-cache for process: %s" % pid)
+
+
+def main(argv=None):
+    """
+    This is the entry point for the application (and all cli commands/options)
+    """
+    commands = {
+        'start': start,
+        'stop': stop,
+        'reset': reset,
+        'status': status,
+        'restart': restart,
+    }
+    
+    # parse the cli arguments, and command
+    
+    # Top level parser
+    parser = argparse.ArgumentParser(prog=APPNAME)
+    subparsers = parser.add_subparsers(help='--- available sub-commands ---', dest='command')
+    startp = subparsers.add_parser('start', help='start the %s web server' % APPNAME)
+    subparsers.add_parser('stop', help='stop the %s web server' % APPNAME)
+    subparsers.add_parser('reset', help='reset the allowed client list')
+    subparsers.add_parser('status', help='get the status of the %s daemon' % APPNAME)
+    subparsers.add_parser('restart', help='restart the %s daemon' % APPNAME)
+    
+    # -- Configure the start command options ----------------------------------
+    startp.add_argument('--port', metavar='', required=False, help='http port to redirect and serve from')
+    startp.add_argument('--interface', metavar='', required=False, help='interface name to redirect traffic from (wlan0)')
+    startp.add_argument('-n', '--nodaemon', action='store_true', 
+        help="Don't daemonize, don't use default umask of 0077")
+    startp.add_argument('--log', action='store_true',
+        help='log to stdout, file log is located in /var/log/captiveportal')
+    args = vars(parser.parse_args())
+    func = commands.get(args['command'])
+    func(args)
+    
+    return 0
+    
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
+
+    
+
