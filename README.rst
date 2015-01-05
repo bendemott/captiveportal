@@ -1,3 +1,7 @@
+.. image:: http://i.imgur.com/5CkR3m8.png
+   :scale: 50
+   :alt: captive-portal-page
+
 **About**:
 
     A captive portal is a bit of software trickery that captures network requests going over
